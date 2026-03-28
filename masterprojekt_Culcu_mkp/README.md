@@ -123,3 +123,11 @@ The solver prints:
 4. Configuration enumeration counts
 5. ILP solving progress (from GLPK)
 6. Final solution: items assigned to each knapsack with weights and profits
+
+## Changes made to previous version
+**Problem identified**: The pivot selection heuristic (choosing the item type with the largest `multiplicity × weight`) does not always work. The test instance `test.txt` demonstrates this — with 2 item types (weight=2/profit=1/count=100 and weight=3/profit=100/count=100), 2 big knapsacks (capacity 100), and 100 small knapsacks (capacity 3), the heuristic picks item type 1 as pivot, but the resulting ILP becomes infeasible or suboptimal due to the pivot constraint reserving `|B| × wmax²` items.
+
+**Fix applied**: 
+- **`mkp_solve()` now tries ALL item types as pivot candidates** and returns the best solution found. This eliminates the reliance on the heuristic and guarantees correctness.
+- **Added `mkp_solve_direct_ilp()`** as a fallback: a simpler configuration ILP without pivot constraints. If no pivot-based solution is feasible, this direct formulation is used instead. This handles edge cases where the pivot decomposition is too restrictive.
+- Updated `mkp.h` to declare `mkp_solve_direct_ilp()`.
