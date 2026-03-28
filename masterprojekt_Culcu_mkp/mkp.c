@@ -5,6 +5,10 @@
  * Lars Rohwedder for Q||Cmax, extended with profits and bundles.
  *
  * Uses GLPK (GNU Linear Programming Kit) for solving the ILP.
+ *
+ * Key improvement: tries ALL item types as pivot candidates and
+ * returns the best solution found, rather than relying on a single
+ * heuristic choice.
  */
 
 #include <stdio.h>
@@ -91,30 +95,23 @@ void mkp_partition_knapsacks(MKPInstance *inst)
 /* ============================================================
  * mkp_find_pivot
  *
- * Choose pivot item type 'a' such that it has at least
- * |B| * wmax^2 items in big knapsacks in an optimal solution.
- * Heuristic: item type with largest (multiplicity * weight).
+ * Set the pivot item type to a specified index.
+ * (Previously used a heuristic; now called multiple times
+ *  by mkp_solve to try all candidates.)
  * ============================================================ */
 void mkp_find_pivot(MKPInstance *inst)
 {
-    long long best_score = -1;
-    int best_idx = 0;
-
-    for (int i = 0; i < inst->d; i++) {
-        long long score = (long long)inst->items[i].multiplicity *
-                          inst->items[i].weight;
-        if (score > best_score) {
-            best_score = score;
-            best_idx   = i;
-        }
+    /* This function now just reports the currently set pivot.
+     * The actual pivot selection is done in mkp_solve, which
+     * iterates over all item types as pivot candidates. */
+    int idx = inst->pivot;
+    if (idx >= 0 && idx < inst->d) {
+        printf("[MKP] Pivot item type: %d (weight=%d, profit=%d, mult=%d)\n",
+               idx,
+               inst->items[idx].weight,
+               inst->items[idx].profit,
+               inst->items[idx].multiplicity);
     }
-
-    inst->pivot = best_idx;
-    printf("[MKP] Pivot item type: %d (weight=%d, profit=%d, mult=%d)\n",
-           best_idx,
-           inst->items[best_idx].weight,
-           inst->items[best_idx].profit,
-           inst->items[best_idx].multiplicity);
 }
 
 /* ============================================================
@@ -258,7 +255,7 @@ void mkp_enumerate_configs(MKPInstance *inst)
  *
  * Constraints:
  *   (1) sum_{C in C(tau)} y_{tau,C} = m(tau)        for all tau
- *   (2) sum_{tau} sum_C C_a * y_{tau,C} + w_a * b_i <= n_i
+ *   (2) sum_{tau} sum_C C_i * y_{tau,C} + w_a * b_i <= n_i
  *                                                    for all i != a
  *   (3) sum_{tau} sum_C C_a * y_{tau,C} + b_a <= n_a - |B|*wmax^2
  *   (4) sum_{tau} sum_C y_{tau,C} * W(C) <= sum C_j - |B|*wmax^2*w_a
@@ -649,6 +646,11 @@ MKPSolution mkp_construct_solution(MKPInstance *inst,
 
 /* ============================================================
  * mkp_solve  (top-level pipeline)
+ *
+ * Tries ALL item types as pivot candidates and returns
+ * the best solution found. This is essential for correctness:
+ * the original heuristic (largest weight * multiplicity) does
+ * not guarantee an optimal pivot choice.
  * ============================================================ */
 MKPSolution mkp_solve(MKPInstance *inst)
 {
@@ -663,17 +665,262 @@ MKPSolution mkp_solve(MKPInstance *inst)
     /* Step 1: Partition knapsacks */
     mkp_partition_knapsacks(inst);
 
-    /* Step 2: Find pivot item type */
-    mkp_find_pivot(inst);
-
-    /* Step 3: Build knapsack types */
+    /* Step 2: Build knapsack types (independent of pivot) */
     mkp_build_knapsack_types(inst);
 
-    /* Step 4: Enumerate configurations */
-    mkp_enumerate_configs(inst);
+    /* Step 3: Try each item type as pivot, keep best solution */
+    MKPSolution best_sol;
+    memset(&best_sol, 0, sizeof(best_sol));
+    best_sol.feasible = false;
+    best_sol.total_profit = -1;
 
-    /* Step 5: Build and solve ILP */
-    MKPSolution sol = mkp_solve_ilp(inst);
+    int best_pivot = -1;
+
+    /* Save original config state so we can reset between pivots */
+    for (int pivot_candidate = 0; pivot_candidate < inst->d; pivot_candidate++) {
+        printf("\n--- Trying pivot candidate %d (weight=%d, profit=%d, mult=%d) ---\n",
+               pivot_candidate,
+               inst->items[pivot_candidate].weight,
+               inst->items[pivot_candidate].profit,
+               inst->items[pivot_candidate].multiplicity);
+
+        /* Set the pivot */
+        inst->pivot = pivot_candidate;
+        mkp_find_pivot(inst);
+
+        /* Reset configurations for this pivot attempt */
+        inst->num_configs = 0;
+        for (int t = 0; t < inst->num_knap_types; t++) {
+            inst->knap_types[t].num_configs = 0;
+            inst->knap_types[t].config_start = 0;
+        }
+
+        /* Enumerate configurations (may differ if pivot affects pruning) */
+        mkp_enumerate_configs(inst);
+
+        /* Skip if no configurations were generated */
+        if (inst->num_configs == 0) {
+            printf("[MKP] No configurations generated for pivot %d, skipping.\n",
+                   pivot_candidate);
+            continue;
+        }
+
+        /* Solve ILP with this pivot */
+        MKPSolution sol = mkp_solve_ilp(inst);
+
+        if (sol.feasible && sol.total_profit > best_sol.total_profit) {
+            best_sol = sol;
+            best_pivot = pivot_candidate;
+            printf("[MKP] New best solution with pivot %d: profit = %d\n",
+                   pivot_candidate, sol.total_profit);
+        }
+    }
+
+    if (best_sol.feasible) {
+        printf("\n[MKP] Best pivot: %d, Best profit: %d\n",
+               best_pivot, best_sol.total_profit);
+        inst->pivot = best_pivot;
+    } else {
+        printf("\n[MKP] No feasible solution found with any pivot.\n");
+
+        /* Fallback: try a direct ILP without pivot constraints.
+         * This handles cases where the pivot-based decomposition
+         * is too restrictive. */
+        printf("[MKP] Attempting direct configuration ILP (no pivot constraints)...\n");
+        inst->pivot = 0;
+
+        /* Reset and enumerate configs */
+        inst->num_configs = 0;
+        for (int t = 0; t < inst->num_knap_types; t++) {
+            inst->knap_types[t].num_configs = 0;
+            inst->knap_types[t].config_start = 0;
+        }
+        mkp_enumerate_configs(inst);
+
+        /* Build a direct ILP: just configuration selection + item limits */
+        best_sol = mkp_solve_direct_ilp(inst);
+    }
+
+    return best_sol;
+}
+
+/* ============================================================
+ * mkp_solve_direct_ilp
+ *
+ * A simpler ILP formulation without pivot constraints.
+ * Used as a fallback when the pivot-based approach fails.
+ *
+ * Variables:
+ *   y_{tau,C}  for each knapsack type tau and config C
+ *
+ * Objective: maximize sum of profits
+ *
+ * Constraints:
+ *   (1) sum_{C in C(tau)} y_{tau,C} = m(tau)        for all tau
+ *   (2) sum_{tau} sum_C C_i * y_{tau,C} <= n_i      for all i
+ *   (3) y_{tau,C} >= 0, integer
+ * ============================================================ */
+MKPSolution mkp_solve_direct_ilp(MKPInstance *inst)
+{
+    MKPSolution sol;
+    memset(&sol, 0, sizeof(sol));
+    sol.feasible = false;
+
+    int num_y = inst->num_configs;
+    int total_vars = num_y;
+
+    /* Constraints: one per knapsack type + one per item type */
+    int total_cstr = inst->num_knap_types + inst->total_types;
+
+    printf("[MKP] Direct ILP: %d variables, %d constraints\n",
+           total_vars, total_cstr);
+
+    glp_prob *lp = glp_create_prob();
+    glp_set_prob_name(lp, "MKP_direct");
+    glp_set_obj_dir(lp, GLP_MAX);
+
+    glp_add_cols(lp, total_vars);
+
+    /* y variables */
+    for (int t = 0; t < inst->num_knap_types; t++) {
+        int start = inst->knap_types[t].config_start;
+        int nc    = inst->knap_types[t].num_configs;
+        for (int c = 0; c < nc; c++) {
+            int col = start + c + 1;
+            char name[64];
+            snprintf(name, sizeof(name), "y_%d_%d", t, c);
+            glp_set_col_name(lp, col, name);
+            glp_set_col_kind(lp, col, GLP_IV);
+            glp_set_col_bnds(lp, col, GLP_LO, 0.0, 0.0);
+
+            Configuration *cfg = &inst->configs[start + c];
+            glp_set_obj_coef(lp, col, (double)cfg->total_profit);
+        }
+    }
+
+    glp_add_rows(lp, total_cstr);
+
+    int max_nz = total_vars * total_cstr;
+    if (max_nz > 1000000) max_nz = 1000000;
+    int *ia  = (int *)malloc((max_nz + 1) * sizeof(int));
+    int *ja  = (int *)malloc((max_nz + 1) * sizeof(int));
+    double *ar = (double *)malloc((max_nz + 1) * sizeof(double));
+    int nz = 0;
+    int row = 0;
+
+    /* Constraint (1): knapsack type counts */
+    for (int t = 0; t < inst->num_knap_types; t++) {
+        row++;
+        char name[64];
+        snprintf(name, sizeof(name), "type_eq_%d", t);
+        glp_set_row_name(lp, row, name);
+        glp_set_row_bnds(lp, row, GLP_FX,
+                         (double)inst->knap_types[t].count,
+                         (double)inst->knap_types[t].count);
+
+        int start = inst->knap_types[t].config_start;
+        int nc    = inst->knap_types[t].num_configs;
+        for (int c = 0; c < nc; c++) {
+            nz++;
+            ia[nz] = row;
+            ja[nz] = start + c + 1;
+            ar[nz] = 1.0;
+        }
+    }
+
+    /* Constraint (2): item multiplicity limits */
+    for (int i = 0; i < inst->total_types; i++) {
+        row++;
+        char name[64];
+        snprintf(name, sizeof(name), "item_%d", i);
+        glp_set_row_name(lp, row, name);
+        glp_set_row_bnds(lp, row, GLP_UP, 0.0,
+                         (double)inst->items[i].multiplicity);
+
+        for (int t = 0; t < inst->num_knap_types; t++) {
+            int start = inst->knap_types[t].config_start;
+            int nc    = inst->knap_types[t].num_configs;
+            for (int c = 0; c < nc; c++) {
+                int cnt = inst->configs[start + c].items[i];
+                if (cnt != 0) {
+                    nz++;
+                    ia[nz] = row;
+                    ja[nz] = start + c + 1;
+                    ar[nz] = (double)cnt;
+                }
+            }
+        }
+    }
+
+    glp_load_matrix(lp, nz, ia, ja, ar);
+
+    glp_iocp parm;
+    glp_init_iocp(&parm);
+    parm.presolve = GLP_ON;
+    parm.msg_lev  = GLP_MSG_ON;
+    parm.tm_lim   = 60000;
+
+    printf("[MKP] Solving direct ILP with GLPK...\n");
+    int ret = glp_intopt(lp, &parm);
+
+    if (ret != 0) {
+        glp_simplex(lp, NULL);
+        ret = glp_intopt(lp, &parm);
+    }
+
+    int status = glp_mip_status(lp);
+    if (status == GLP_OPT || status == GLP_FEAS) {
+        printf("[MKP] Direct ILP solved. Status: %s, Objective: %.0f\n",
+               (status == GLP_OPT) ? "OPTIMAL" : "FEASIBLE",
+               glp_mip_obj_val(lp));
+
+        sol.feasible = true;
+        sol.total_profit = 0;
+
+        /* Reconstruct solution from y values */
+        int knapsack_idx = 0;
+        int ks_order[MAX_KNAPSACKS];
+        for (int j = 0; j < inst->m; j++) ks_order[j] = j;
+        for (int i = 1; i < inst->m; i++) {
+            int key = ks_order[i];
+            int j = i - 1;
+            while (j >= 0 &&
+                   inst->knapsacks[ks_order[j]].capacity >
+                   inst->knapsacks[key].capacity) {
+                ks_order[j + 1] = ks_order[j];
+                j--;
+            }
+            ks_order[j + 1] = key;
+        }
+
+        for (int t = 0; t < inst->num_knap_types; t++) {
+            int start = inst->knap_types[t].config_start;
+            int nc    = inst->knap_types[t].num_configs;
+
+            for (int c = 0; c < nc; c++) {
+                int y_count = (int)(glp_mip_col_val(lp, start + c + 1) + 0.5);
+                Configuration *cfg = &inst->configs[start + c];
+
+                for (int rep = 0; rep < y_count && knapsack_idx < inst->m;
+                     rep++) {
+                    int kj = ks_order[knapsack_idx];
+                    for (int i = 0; i < inst->total_types; i++) {
+                        int cnt = cfg->items[i];
+                        sol.assignment[kj][i] = cnt;
+                        sol.total_profit += cnt * inst->items[i].profit;
+                    }
+                    knapsack_idx++;
+                }
+            }
+        }
+    } else {
+        printf("[MKP] Direct ILP infeasible. Status: %d\n", status);
+    }
+
+    free(ia);
+    free(ja);
+    free(ar);
+    glp_delete_prob(lp);
 
     return sol;
 }
