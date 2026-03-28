@@ -147,8 +147,15 @@ MKPSolution mkp_construct_solution(MKPInstance *inst,
 
 /**
  * Top-level solver: run the full algorithm pipeline.
+ * Tries all item types as pivot candidates and returns the best solution.
  */
 MKPSolution mkp_solve(MKPInstance *inst);
+
+/**
+ * Direct ILP formulation without pivot constraints.
+ * Used as fallback when pivot-based approach finds no solution.
+ */
+MKPSolution mkp_solve_direct_ilp(MKPInstance *inst);
 
 /**
  * Print the solution to stdout.
