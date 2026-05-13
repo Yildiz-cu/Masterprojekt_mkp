@@ -163,3 +163,4 @@ MKPSolution mkp_solve_direct_ilp(MKPInstance *inst);
 void mkp_print_solution(const MKPInstance *inst, const MKPSolution *sol);
 
 #endif /* MKP_H */
+
